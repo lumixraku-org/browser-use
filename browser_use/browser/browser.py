@@ -22,13 +22,52 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 load_dotenv()
 
-from browser_use.browser.chrome import (
-	CHROME_ARGS,
-	CHROME_DETERMINISTIC_RENDERING_ARGS,
-	CHROME_DISABLE_SECURITY_ARGS,
-	CHROME_DOCKER_ARGS,
-	CHROME_HEADLESS_ARGS,
-)
+# Modified Chrome arguments - removed any potential incognito flags
+CHROME_ARGS = [
+	'--disable-background-networking',
+	'--enable-features=NetworkService,NetworkServiceInProcess',
+	'--disable-background-timer-throttling',
+	'--disable-backgrounding-occluded-windows',
+	'--disable-breakpad',
+	'--disable-client-side-phishing-detection',
+	'--disable-component-extensions-with-background-pages',
+	'--disable-default-apps',
+	'--disable-dev-shm-usage',
+	'--disable-extensions',
+	'--disable-features=Translate,BackForwardCache,AcceptCHFrame',
+	'--disable-hang-monitor',
+	'--disable-ipc-flooding-protection',
+	'--disable-popup-blocking',
+	'--disable-prompt-on-repost',
+	'--disable-renderer-backgrounding',
+	'--disable-sync',
+	'--force-color-profile=srgb',
+	'--metrics-recording-only',
+	'--no-first-run',
+	'--remote-debugging-port=9222',
+	'--no-default-browser-check',
+]
+
+CHROME_DOCKER_ARGS = [
+	'--disable-setuid-sandbox',
+	'--no-sandbox',
+	'--disable-gpu',
+]
+
+CHROME_HEADLESS_ARGS = [
+	'--headless=new',
+]
+
+CHROME_DISABLE_SECURITY_ARGS = [
+	'--disable-web-security',
+	'--allow-running-insecure-content',
+]
+
+CHROME_DETERMINISTIC_RENDERING_ARGS = [
+	'--deterministic-mode',
+	'--force-deterministic-compositing',
+]
+
 from browser_use.browser.context import BrowserContext, BrowserContextConfig
 from browser_use.browser.utils.screen_resolution import get_screen_resolution, get_window_adjustments
 from browser_use.utils import time_execution_async
@@ -110,6 +149,9 @@ class BrowserConfig(BaseModel):
 
 	proxy: ProxySettings | None = None
 	new_context_config: BrowserContextConfig = Field(default_factory=BrowserContextConfig)
+	
+	# Added user data directory to preserve cookies and history
+	user_data_dir: str | None = None
 
 
 # @singleton: TODO - think about id singleton makes sense here
@@ -133,7 +175,7 @@ class Browser:
 
 	async def new_context(self, config: BrowserContextConfig | None = None) -> BrowserContext:
 		"""Create a browser context"""
-		return BrowserContext(config=config or self.config, browser=self)
+		return BrowserContext(config=config or self.config.new_context_config, browser=self)
 
 	async def get_playwright_browser(self) -> PlaywrightBrowser:
 		"""Get a browser context"""
@@ -198,18 +240,25 @@ class Browser:
 		except requests.ConnectionError:
 			logger.debug('🌎  No existing Chrome instance found, starting a new one')
 
-		# Start a new Chrome instance
+		# Start a new Chrome instance with user data directory if specified
+		chrome_args = {
+			*CHROME_ARGS,
+			*(CHROME_DOCKER_ARGS if IN_DOCKER else []),
+			*(CHROME_HEADLESS_ARGS if self.config.headless else []),
+			*(CHROME_DISABLE_SECURITY_ARGS if self.config.disable_security else []),
+			*(CHROME_DETERMINISTIC_RENDERING_ARGS if self.config.deterministic_rendering else []),
+			*self.config.extra_browser_args,
+		}
+		
+		# Add user data directory for cookie persistence
+		if self.config.user_data_dir:
+			chrome_args.add(f'--user-data-dir={self.config.user_data_dir}')
+		
 		chrome_launch_cmd = [
 			self.config.browser_binary_path,
-			*{  # remove duplicates (usually preserves the order, but not guaranteed)
-				*CHROME_ARGS,
-				*(CHROME_DOCKER_ARGS if IN_DOCKER else []),
-				*(CHROME_HEADLESS_ARGS if self.config.headless else []),
-				*(CHROME_DISABLE_SECURITY_ARGS if self.config.disable_security else []),
-				*(CHROME_DETERMINISTIC_RENDERING_ARGS if self.config.deterministic_rendering else []),
-				*self.config.extra_browser_args,
-			},
+			*chrome_args,
 		]
+		
 		self._chrome_subprocess = psutil.Process(
 			subprocess.Popen(
 				chrome_launch_cmd,
@@ -264,6 +313,10 @@ class Browser:
 			f'--window-size={screen_size["width"]},{screen_size["height"]}',
 			*self.config.extra_browser_args,
 		}
+		
+		# Add user data directory for cookie persistence
+		if self.config.user_data_dir:
+			chrome_args.add(f'--user-data-dir={self.config.user_data_dir}')
 
 		# check if port 9222 is already taken, if so remove the remote-debugging-port arg to prevent conflicts
 		with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -287,13 +340,20 @@ class Browser:
 			],
 		}
 
-		browser = await browser_class.launch(
-			headless=self.config.headless,
-			args=args[self.config.browser_class],
-			proxy=self.config.proxy.model_dump() if self.config.proxy else None,
-			handle_sigterm=False,
-			handle_sigint=False,
-		)
+		launch_options = {
+			'headless': self.config.headless,
+			'args': args[self.config.browser_class],
+			'proxy': self.config.proxy.model_dump() if self.config.proxy else None,
+			'handle_sigterm': False,
+			'handle_sigint': False,
+			'channel': 'chrome'  # Explicitly set channel to Chrome
+		}
+		
+		# Add user data directory for cookie persistence in launch options
+		if self.config.user_data_dir:
+			launch_options['user_data_dir'] = self.config.user_data_dir
+
+		browser = await browser_class.launch(**launch_options)
 		return browser
 
 	async def _setup_browser(self, playwright: Playwright) -> PlaywrightBrowser:
